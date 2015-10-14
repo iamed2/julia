@@ -1552,24 +1552,20 @@ static int tupletype_any_bottom(jl_value_t *sig)
     return 0;
 }
 
-static int jl_compile_all_defs(jl_function_t *gf)
-{
-    assert(jl_is_gf(gf));
-    jl_methtable_t *mt = jl_gf_mtable(gf);
-    if (mt->kwsorter != NULL)
-        jl_compile_all_defs(mt->kwsorter);
-    jl_methlist_t *m = mt->defs;
-    jl_function_t *func = NULL;
-    JL_GC_PUSH1(&func);
-    while ((jl_value_t*)m != jl_nothing) {
+static void do_work(jl_array_t *found) {
+    size_t i, l = jl_array_len(a);
+    for (i = 0; i < l; i += 2) {
+        jl_methlist_t *m = jl_cellref(a, i); // XXX: this isn't what is in the array
+        jl_function_t *gf = jl_cellref(a, i + 1);
+
         if (jl_is_leaf_type((jl_value_t*)m->sig)) {
             // usually can create a specialized version of the function,
             // if the signature is already a leaftype
             if (jl_get_specialization(gf, m->sig)) {
-                m = m->next;
                 continue;
             }
         }
+
         if (jl_is_typevar(m->tvars)) {
             // f{T<:Union{...}}(...) is a common pattern
             // and expanding the Union may give a leaf function
@@ -1602,123 +1598,56 @@ static int jl_compile_all_defs(jl_function_t *gf)
                     complete = 0;
                 }
                 if (complete) {
-                    m = m->next;
                     continue;
                 }
             }
         }
-        func = m->func->linfo->unspecialized;
-        if (func == NULL) {
-            func = jl_instantiate_method(m->func, jl_emptysvec);
-            if (func->env != (jl_value_t*)jl_emptysvec)
-                func->env = NULL;
-            m->func->linfo->unspecialized = func;
-            jl_gc_wb(m->func->linfo, func);
-        }
+
         if (func->fptr == &jl_trampoline) {
             precompile_unspecialized(func, m->sig, m->tvars);
         }
-        m = m->next;
     }
-
-    JL_GC_POP();
-    return 1;
 }
 
-static int jl_compile_cache(jl_methlist_t *m)
+static void _compile_all(jl_value_t *v, htable_t *h, jl_array_t *found, jl_function_t *in_gf, int in_ml) // XXX: how to compute in_gf and in_ml?
 {
-    int changes = 0;
-    // make sure everything in the cache has a fptr assigned
-    while ((jl_value_t*)m != jl_nothing) {
-        jl_function_t *func = m->func;
-        if (func != jl_bottom_func && func->fptr == &jl_trampoline) {
-            jl_trampoline_compile_function(func, 1, m->sig);
-            changes = 1;
-        }
-        m = m->next;
-        continue;
-    }
-    return changes;
-}
-
-static int jl_trampoline_compile_cache(jl_array_t **pa)
-{
-    int changes = 0;
-    jl_array_t *a = *pa;
-    if ((jl_value_t*)a == jl_nothing)
-        return 0;
-    size_t i, l = jl_array_len(a);
-    for (i = 0; i < l; i++) {
-        jl_methlist_t *m = (jl_methlist_t*)jl_cellref(a, i);
-        if (m) {
-            changes = jl_compile_cache(m) || changes;
-            if (*pa != a) {
-                // cache changed, restart
-                a = *pa;
-                i = 0;
-                l = jl_array_len(a);
-            }
-        }
-    }
-    return changes;
-}
-
-static int jl_compile_all_cache(jl_function_t *gf)
-{
-    assert(jl_is_gf(gf));
-    int changes = 0;
-    jl_methtable_t *mt = jl_gf_mtable(gf);
-    if (mt->kwsorter != NULL)
-        changes = jl_compile_all_cache(mt->kwsorter) || changes;
-    changes = jl_compile_cache(mt->cache) || changes;
-    changes = jl_trampoline_compile_cache(&mt->cache_arg1) || changes;
-    changes = jl_trampoline_compile_cache(&mt->cache_targ) || changes;
-    return changes;
-}
-
-static int _compile_all(jl_value_t *v, htable_t *h, int do_cache_only);
-
-static int _compile_all_module(jl_module_t *m, htable_t *h, int do_cache_only)
-{
-    int changes = 0;
-    size_t i;
-    size_t sz = m->bindings.size;
-    void **table = (void**) malloc(sz * sizeof(void*));
-    memcpy(table, m->bindings.table, sz*sizeof(void*));
-    for(i=1; i < sz; i+=2) {
-        if (table[i] != HT_NOTFOUND) {
-            jl_binding_t *b = (jl_binding_t*)table[i];
-            jl_value_t *v = b->value;
-            if (v != NULL) {
-                changes = _compile_all(v, h, do_cache_only) || changes;
-            }
-        }
-    }
-    free(table);
-
-    if (m->constant_table != NULL) {
-        for(i=0; i < jl_array_len(m->constant_table); i++) {
-            jl_value_t *v = jl_cellref(m->constant_table, i);
-            changes = _compile_all(v, h, do_cache_only) || changes;
-        }
-    }
-    return changes;
-}
-
-static int _compile_all(jl_value_t *v, htable_t *h, int do_cache_only)
-{
-    int changes = 0;
     if (!ptrhash_has(h, v)) {
         ptrhash_put(h, v, v);
-        if (jl_is_gf(v)) {
-            if (!do_cache_only)
-                changes = jl_compile_all_defs((jl_function_t*)v) || changes;
-            changes = jl_compile_all_cache((jl_function_t*)v) || changes;
+        if (jl_is_module(v)) {
+            jl_module_t *m = (jl_module_t*)v;
+            size_t i;
+            size_t sz = m->bindings.size;
+            for(i=1; i < sz; i+=2) {
+                if (table[i] != HT_NOTFOUND) {
+                    jl_binding_t *b = (jl_binding_t*)table[i];
+                    jl_value_t *v = b->value;
+                    if (v != NULL) {
+                        _compile_all(v, h, found, 0);
+                    }
+                }
+            }
+            if (m->constant_table != NULL) {
+                for(i=0; i < jl_array_len(m->constant_table); i++) {
+                    jl_value_t *v = jl_cellref(m->constant_table, i);
+                    _compile_all(v, h, found, 0);
+                }
+            }
         }
-        else if (jl_is_module(v)) {
-            changes = _compile_all_module((jl_module_t*)v, h, do_cache_only) || changes;
+        else if (jl_is_methlist(v)) {
+            jl_methlist_t m = (jl_methlist_t*)v;
+            // make sure everything in the methlist has a fptr assigned
+            while ((jl_value_t*)m != jl_nothing) {
+                jl_function_t *func = m->func;
+                if (func->fptr == &jl_trampoline) {
+                    jl_cell_1d_push(found, (jl_value_t*)m);
+                    jl_cell_1d_push(found, (jl_value_t*)in_gf);
+                }
+                _compile_all((jl_value_t*)func, h, found, 1);
+                m = m->next;
+                continue;
+            }
         }
-        else if (jl_is_lambda_info(v)) {
+        else if (jl_is_lambda_info(v) && !in_ml) {
             jl_lambda_info_t *li = (jl_lambda_info_t*)v;
             jl_function_t *func = li->unspecialized;
             if (func == NULL) {
@@ -1726,9 +1655,19 @@ static int _compile_all(jl_value_t *v, htable_t *h, int do_cache_only)
                 li->unspecialized = func;
                 jl_gc_wb(li, func);
             }
+            ptrhash_put(h, func, func); // don't recurse into unspecialized. XXX: this is broken
             if (func->fptr == &jl_trampoline) {
-                precompile_unspecialized(func, li->specTypes ? li->specTypes : jl_anytuple_type, jl_emptysvec);
-                changes = 1;
+                jl_cell_1d_push(found, (jl_value_t*)func);
+                jl_cell_1d_push(found, (jl_value_t*)NULL);
+            }
+        }
+        else if (jl_is_array(v)) {
+            jl_array_t *a = (jl_array_t*)v;
+            if (a->ptrarray) {
+                size_t i, l = jl_array_len(a);
+                for (i = 0; i < l; i++) {
+                    _compile_all(jl_cellref(a, i), h, found, 0);
+                }
             }
         }
         jl_datatype_t *dt = (jl_datatype_t*)jl_typeof(v);
@@ -1739,12 +1678,11 @@ static int _compile_all(jl_value_t *v, htable_t *h, int do_cache_only)
                     ((char*)v + jl_field_offset(dt, i));
                 jl_value_t *fld = *slot;
                 if (fld) {
-                    changes = _compile_all(fld, h, do_cache_only) || changes;
+                    _compile_all(fld, h, found, 0);
                 }
             }
         }
     }
-    return changes;
 }
 
 void jl_compile_all(void)
@@ -1752,10 +1690,15 @@ void jl_compile_all(void)
     htable_t h;
     htable_new(&h, 0);
     int changes = 0;
+    jl_array_t *m = jl_alloc_cell_1d(0);
+    JL_GC_PUSH1(&m);
     do {
-        changes = _compile_all((jl_value_t*)jl_main_module, &h, changes);
+        changes = _compile_all((jl_value_t*)jl_main_module, &h, m, 0);
+        do_work(m);
         htable_reset(&h, h.size);
+        jl_array_del_end(m, jl_array_len(m));
     } while (changes);
+    JL_GC_POP();
     htable_free(&h);
 }
 
