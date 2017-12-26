@@ -59,7 +59,7 @@ struct RowVector{T,V<:AbstractVector} <: AbstractMatrix{T}
 end
 
 @inline check_types(::Type{T1}, ::AbstractVector{T2}) where {T1,T2} = check_types(T1, T2)
-@pure check_types(::Type{T1}, ::Type{T2}) where {T1,T2} = T1 === transpose_type(T2) ? nothing :
+@inline check_types(::Type{T1}, ::Type{T2}) where {T1,T2} = T1 === transpose_type(T2) ? nothing :
     error("Element type mismatch. Tried to create a `RowVector{$T1}` from an `AbstractVector{$T2}`")
 
 const ConjRowVector{T,CV<:ConjVector} = RowVector{T,CV}
